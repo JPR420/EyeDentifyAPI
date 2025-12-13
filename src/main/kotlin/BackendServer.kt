@@ -1,4 +1,5 @@
 // BackendServer.kt
+import com.google.gson.Gson
 import edu.farmingdale.DatabaseConfig
 
 import io.ktor.server.engine.*
@@ -17,9 +18,13 @@ import io.ktor.client.statement.*
 import io.ktor.client.plugins.contentnegotiation.*
 import java.util.Base64
 import com.google.gson.JsonParser
+import io.ktor.client.request.forms.*
 import io.ktor.http.*
 import org.mindrot.jbcrypt.BCrypt
 import java.sql.DriverManager
+import io.ktor.client.request.setBody
+import io.ktor.http.ContentType
+
 
 
 fun main() {
@@ -369,6 +374,252 @@ fun main() {
                 } catch (e: Exception) {
                     e.printStackTrace()
                     call.respond(HttpStatusCode.InternalServerError, mapOf("error" to e.message))
+                }
+            }
+
+
+            post("/identify_openai") {
+
+                println("=== /identify_openai endpoint called ===")
+
+                // Receive the file from Android
+                val multipart = call.receiveMultipart()
+                var imageBytes: ByteArray? = null
+
+                multipart.forEachPart { part ->
+                    if (part is PartData.FileItem) {
+                        imageBytes = part.streamProvider().readBytes()
+                    }
+                    part.dispose()
+                }
+
+                if (imageBytes == null) {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No image provided"))
+                    return@post
+                }
+
+                try {
+                    val openAiApiKey = DatabaseConfig.openAiKey
+
+                    //  Convert image to Base64
+                    val base64Image = Base64.getEncoder().encodeToString(imageBytes)
+
+
+                    // We ask OpenAI to return a specific JSON structure so we can parse it easily.
+                    val systemPrompt = """
+            You are an AI assistant that identifies objects in images. 
+            You must return the response in strict JSON format with no markdown formatting.
+            The JSON object must have these keys:
+            - "name": A short name of the object.
+            - "confidence": An estimated confidence percentage (e.g., "95%").
+            - "description": A 2-sentence description of the object.
+            - "link": A generic shopping link for the item (e.g., amazon search) or null if not applicable.
+        """.trimIndent()
+
+                    //  Create the Request Body
+                    val requestPayload = mapOf(
+                        "model" to "gpt-4o-mini",
+                        "messages" to listOf(
+                            mapOf(
+                                "role" to "system",
+                                "content" to systemPrompt
+                            ),
+                            mapOf(
+                                "role" to "user",
+                                "content" to listOf(
+                                    mapOf(
+                                        "type" to "text",
+                                        "text" to "Identify this object."
+                                    ),
+                                    mapOf(
+                                        "type" to "image_url",
+                                        "image_url" to mapOf(
+                                            "url" to "data:image/jpeg;base64,$base64Image"
+                                        )
+                                    )
+                                )
+                            )
+                        ),
+                        "max_tokens" to 300
+                    )
+
+                    val jsonBody = Gson().toJson(requestPayload)
+
+                    val client = HttpClient(CIO) {
+                        install(io.ktor.client.plugins.contentnegotiation.ContentNegotiation) {
+                            gson()
+                        }
+                        engine { requestTimeout = 30000 }
+                    }
+
+                     //Send Request to Endpoint
+                    val response: HttpResponse = client.post("https://api.openai.com/v1/chat/completions") {
+                        header("Authorization", "Bearer $openAiApiKey")
+                        contentType(ContentType.Application.Json)
+                        setBody(jsonBody)
+                    }
+
+                    val bodyText = response.bodyAsText()
+                    client.close()
+
+                    println("OpenAI Raw Response: $bodyText")
+
+                    // Parse the Response
+                    val jsonResponse = JsonParser.parseString(bodyText).asJsonObject
+
+                    // Check for API errors
+                    if (jsonResponse.has("error")) {
+                        val errMsg = jsonResponse["error"].asJsonObject["message"].asString
+                        println("OpenAI API Error: $errMsg")
+                        call.respond(HttpStatusCode.InternalServerError, mapOf("error" to errMsg))
+                        return@post
+                    }
+
+                    // Extract the content string
+                    val contentString = jsonResponse["choices"]?.asJsonArray
+                        ?.get(0)?.asJsonObject
+                        ?.get("message")?.asJsonObject
+                        ?.get("content")?.asString
+
+                    if (contentString != null) {
+                        // Clean up formatting
+                        val cleanJson = contentString.replace("```json", "").replace("```", "").trim()
+
+                        // Parse the clean JSON into a Map/Object to send back to Android
+                        val resultObject = JsonParser.parseString(cleanJson).asJsonObject
+
+                        val result = mapOf(
+                            "name" to (resultObject["name"]?.asString ?: "Unknown"),
+                            "confidence" to (resultObject["confidence"]?.asString ?: "N/A"),
+                            "description" to (resultObject["description"]?.asString ?: "No description"),
+                            "link" to (if (resultObject.has("link") && !resultObject["link"].isJsonNull) resultObject["link"].asString else null)
+                        )
+
+                        call.respond(result)
+                    } else {
+                        call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Failed to parse OpenAI response"))
+                    }
+
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Server exception: ${e.message}"))
+                }
+            }
+
+            post("/identify_plantnet") {
+                println("=== /identify_plantnet endpoint called ===")
+
+                // Receive the file from the Android app
+                val multipart = call.receiveMultipart()
+                var imageBytes: ByteArray? = null
+                var organs: String? = "auto"
+
+                multipart.forEachPart { part ->
+                    when (part) {
+                        is PartData.FileItem -> {
+
+                            if (part.name == "image") {
+                                imageBytes = part.streamProvider().readBytes()
+                                println("Received file in /identify_plantnet, size=${imageBytes?.size}")
+                            }
+                        }
+                        is PartData.FormItem -> {
+
+                            if (part.name == "organs") {
+                                organs = part.value
+                            }
+                        }
+                        else -> {}
+                    }
+                    part.dispose()
+                }
+
+                if (imageBytes == null) {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No image provided"))
+                    return@post
+                }
+
+                try {
+                    val plantNetApiKey = DatabaseConfig.plantNetKey
+                    val client = HttpClient(CIO) {
+                        install(io.ktor.client.plugins.contentnegotiation.ContentNegotiation) {
+                            gson()
+                        }
+                        engine { requestTimeout = 30000 }
+                    }
+
+                    // Forward the request to Pl@ntNet
+                    val response: HttpResponse = client.submitFormWithBinaryData(
+                        // Use 'all' project/flora by default
+                        url = "https://my-api.plantnet.org/v2/identify/all?api-key=$plantNetApiKey",
+                        formData = formData {
+                            // We re-send the binary image data
+                            append(
+                                "images", // Pl@ntNet uses "images" not "image" (important change!)
+                                imageBytes!!,
+                                Headers.build {
+                                    append(HttpHeaders.ContentType, "image/jpeg")
+                                    append(HttpHeaders.ContentDisposition, "filename=\"capture.jpg\"")
+                                }
+                            )
+                            // Optional: tell Pl@ntNet what part of the plant the image shows
+                            append("organs", organs ?: "auto")
+                            // Recommended for better results: set geographic area
+                            // append("lat", "40.7")
+                            // append("lon", "-73.5")
+                        }
+                    )
+
+                    val bodyText = response.bodyAsText()
+                    client.close()
+
+                    println("Pl@ntNet Raw Response: $bodyText")
+
+                    // Parse the Pl@ntNet JSON response
+                    val jsonResponse = JsonParser.parseString(bodyText).asJsonObject
+
+                    // Check for identification matches
+                    val bestMatch = jsonResponse["results"]?.asJsonArray?.firstOrNull()?.asJsonObject
+
+                    if (bestMatch != null) {
+                        val speciesName = bestMatch["species"]?.asJsonObject
+                            ?.get("scientificName")?.asString ?: "Unknown Plant"
+
+                        val confidenceScore = bestMatch["score"]?.asDouble ?: 0.0
+
+                        val commonName = bestMatch["species"]?.asJsonObject
+                            ?.get("commonNames")?.asJsonArray?.firstOrNull()?.asString
+
+                        val name = commonName ?: speciesName
+
+                        // Find a generic Google search link ( This will not be accurate for the specific picture )
+                        val link = "https://www.google.com/search?q=${name.replace(" ", "+")}+plant"
+
+                        // Pl@ntNet doesn't provide a description, so we can generate one or use a placeholder
+                        val description = "Scientific Name: $speciesName. Confidence: ${"%.2f%%".format(confidenceScore * 100)}. Identification provided by Pl@ntNet."
+
+                        val result = mapOf(
+                            "name" to name,
+                            "confidence" to "%.2f%%".format(confidenceScore * 100),
+                            "description" to description,
+                            "link" to link
+                        )
+
+                        call.respond(result)
+
+                    } else {
+                        // Handle case where Pl@ntNet rejects the image or finds no match
+                        call.respond(mapOf(
+                            "name" to "Not Found",
+                            "confidence" to "0.00%",
+                            "description" to "Pl@ntNet could not identify a plant in the image.",
+                            "link" to null
+                        ))
+                    }
+
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Server exception: ${e.message}"))
                 }
             }
 
