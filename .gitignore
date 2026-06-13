@@ -46,3 +46,4 @@ bin/
 
 
 /src/main/kotlin/DatabaseConfig.kt
+/src/main/kotlin/JWT.kt

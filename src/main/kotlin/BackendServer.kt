@@ -15,7 +15,6 @@ import io.ktor.client.*
 import io.ktor.client.engine.cio.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
-import io.ktor.client.plugins.contentnegotiation.*
 import java.util.Base64
 import com.google.gson.JsonParser
 import io.ktor.client.request.forms.*
@@ -24,7 +23,8 @@ import org.mindrot.jbcrypt.BCrypt
 import java.sql.DriverManager
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
-
+import java.sql.ResultSet
+import javax.print.attribute.standard.RequestingUserName
 
 
 fun main() {
@@ -123,6 +123,24 @@ fun main() {
             )
         }
 
+        fun checkUser(email:String?, id :Int): Boolean{
+            try{
+                DriverManager.getConnection( jdbcUrl, username, password).use { conn ->
+                    val statement = conn.prepareStatement(
+                        "SELECT * FROM users WHERE email=? AND id=? "
+                    )
+                    statement.setString(1, email)
+                    statement.setInt(2,id)
+
+                     var response = statement.executeQuery()
+                    return response?.next() ?: false
+                }
+            }catch (e: Exception){
+                println(e)
+            }
+            return false
+        }
+
 
 
 
@@ -130,9 +148,21 @@ fun main() {
 
 
 
-            post("/"){
+            post("/status"){
 
-                call.respond("Hello World!")
+                val params = call.receiveParameters();
+                val email = params["email"];
+                val id: Int? = params["id"]?.toIntOrNull() ;
+                var hello = false;
+
+                if (email != null && id != null) {
+                   hello = checkUser(email, id)
+
+                } else {
+                    println("Email or Id is missing or empty")
+                }
+
+                call.respond("Hello World! and $hello")
 
             }
 
@@ -145,7 +175,7 @@ fun main() {
                 val email = params["email"] ?: ""
                 val pass = params["password"] ?: ""
 
-                println("Register params: email=${params["email"]}, password=${params["password"]?.replace(Regex("."), "*")}")
+                println("Register params: email=${params["email"]}, password=*******")
 
                 val hashedPass = BCrypt.hashpw(pass, BCrypt.gensalt())
 
