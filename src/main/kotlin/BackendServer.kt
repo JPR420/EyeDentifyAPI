@@ -20,41 +20,23 @@ import com.google.gson.JsonParser
 import io.ktor.client.request.forms.*
 import io.ktor.http.*
 import org.mindrot.jbcrypt.BCrypt
-import java.sql.DriverManager
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
-import java.sql.ResultSet
-import javax.print.attribute.standard.RequestingUserName
+
 
 
 fun main() {
-    val jdbcUrl = DatabaseConfig.jdbcUrl
-    val username = DatabaseConfig.username
-    val password = DatabaseConfig.password
     val apiKey = DatabaseConfig.googleKey
 
-
-
+    DatabaseFactory.init(
+        jdbcUrl = DatabaseConfig.jdbcUrl,
+        username = DatabaseConfig.username,
+        pass = DatabaseConfig.password
+    )
 
 
     embeddedServer(Netty, port = 8080) {
         install(ContentNegotiation) { gson() }
-
-        // Create table once at startup
-//        DriverManager.getConnection(jdbcUrl, username, password).use { conn ->
-//            conn.createStatement().use { stmt ->
-//                stmt.execute("""
-//                    CREATE TABLE IF NOT EXISTS users (
-//                        id SERIAL PRIMARY KEY,
-//                        email TEXT UNIQUE NOT NULL,
-//                        password_hash TEXT NOT NULL,
-//                        tier TEXT DEFAULT 'free'
-//                    )
-//                """.trimIndent())
-//            }
-//
-//
-//        }
 
         val client = HttpClient(CIO) {
             install(io.ktor.client.plugins.contentnegotiation.ContentNegotiation) {
@@ -112,7 +94,6 @@ fun main() {
             // Get all labels as a comma-separated string
             val allLabels = labelAnnotations.drop(1).joinToString(", ") { it.asJsonObject["description"].asString }
 
-
             val mainLabel = labelAnnotations[0].asJsonObject["description"]?.asString ?: "Unknown"
             val score = (labelAnnotations[0].asJsonObject["score"]?.asFloat ?: 0f) * 100
 
@@ -125,7 +106,7 @@ fun main() {
 
         fun checkUser(email:String?, id :Int): Boolean{
             try{
-                DriverManager.getConnection( jdbcUrl, username, password).use { conn ->
+                DatabaseFactory.getConnection().use { conn ->
                     val statement = conn.prepareStatement(
                         "SELECT * FROM users WHERE email=? AND id=? "
                     )
@@ -141,56 +122,92 @@ fun main() {
             return false
         }
 
+        fun validateEmailAndPassword(email: String, password: String): Map<String, Any> {
+            // Standard RFC 5322 official email regex format
+            val emailRegex = "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\$".toRegex()
+
+            // Individual password regexes for granular error messages
+            val passwordLengthRegex = ".{8,}".toRegex()
+            val passwordNumberRegex = ".*\\d.*".toRegex()
+            val passwordSymbolRegex = """.*[.!@#$%&*~`/\x5C\x2D+\[\]{}();'":<>].*""".toRegex()
+
+            // Validate Email
+            if (!emailRegex.matches(email)) {
+                return mapOf(
+                    "success" to false,
+                    "message" to "The email address format is invalid."
+                )
+            }
+
+            // Validate Password Length (At least 8 characters)
+            if (!passwordLengthRegex.matches(password)) {
+                return mapOf(
+                    "success" to false,
+                    "message" to "Password is too short. It must be at least 8 characters long."
+                )
+            }
+
+            // Validate Password Number (At least 1 number)
+            if (!passwordNumberRegex.matches(password)) {
+                return mapOf(
+                    "success" to false,
+                    "message" to "Password must contain at least one number (0-9)."
+                )
+            }
+
+            //Validate Password Symbol
+            if (!passwordSymbolRegex.matches(password)) {
+                return mapOf(
+                    "success" to false,
+                    "message" to """Password must contain at least one special character .@#${'$'}%&*~!`/\-+*[]{}();'":<>"""
+                )
+            }
+
+            // All checks passed!
+            return mapOf(
+                "success" to true,
+                "message" to "Email and password are valid."
+            )
+        }
+
 
 
 
         routing {
 
-
-
             post("/status"){
-
-                val params = call.receiveParameters();
-                val email = params["email"];
-                val id: Int? = params["id"]?.toIntOrNull() ;
-                var hello = false;
-
-                if (email != null && id != null) {
-                   hello = checkUser(email, id)
-
-                } else {
-                    println("Email or Id is missing or empty")
-                }
-
-                call.respond("Hello World! and $hello")
-
+                call.respond(
+                    mapOf(
+                        "success" to true,
+                        "message" to "UP"
+                    ) )
             }
 
-
-
             post("/register") {
-                println("=== /register endpoint called ===")
-
                 val params = call.receiveParameters()
                 val email = params["email"] ?: ""
                 val pass = params["password"] ?: ""
+                var regexPassed = mapOf<String, Any>()
 
-                println("Register params: email=${params["email"]}, password=*******")
-
-                val hashedPass = BCrypt.hashpw(pass, BCrypt.gensalt())
+                regexPassed = validateEmailAndPassword(email,pass)
+                if (regexPassed["success"] != true) {
+                    call.respond(
+                        regexPassed
+                    )
+                    return@post
+                }
 
                 try {
-                    DriverManager.getConnection(jdbcUrl, username, password).use { conn ->
+                    val hashedPass = BCrypt.hashpw(pass, BCrypt.gensalt())
+                    DatabaseFactory.getConnection().use { conn ->
                         val stmt = conn.prepareStatement(
                             "INSERT INTO users (email, password_hash) VALUES (?, ?)"
                         )
                         stmt.setString(1, email)
                         stmt.setString(2, hashedPass)
-
                         val inserted = stmt.executeUpdate() > 0
                         call.respond(mapOf("success" to inserted))
                     }
-
                 } catch (e: java.sql.SQLException) {
                     if (e.sqlState == "23505") {
                         call.respond(
@@ -203,7 +220,7 @@ fun main() {
                         call.respond(
                             mapOf(
                                 "success" to false,
-                                "message" to "Database error: ${e.message}"
+                                "message" to "Error registering user"
                             )
                         )
                     }
@@ -212,39 +229,48 @@ fun main() {
 
 
             post("/login") {
-                println("=== /login endpoint called ===")
-
                 val params = call.receiveParameters()
                 val email = params["email"] ?: ""
                 val pass = params["password"] ?: ""
 
-                println("Login params: email=${params["email"]}, password=${params["password"]?.replace(Regex("."), "*")}")
+                try {
+                    DatabaseFactory.getConnection().use { conn ->
+                        val stmt = conn.prepareStatement(
+                            "SELECT id, tier, password_hash FROM users WHERE email=?"
+                        )
+                        stmt.setString(1, email)
+                        val rs = stmt.executeQuery()
 
-                DriverManager.getConnection(jdbcUrl, username, password).use { conn ->
-                    val stmt = conn.prepareStatement(
-                        "SELECT id, tier, password_hash FROM users WHERE email=?"
-                    )
-                    stmt.setString(1, email)
-                    val rs = stmt.executeQuery()
+                        if (rs.next()) {
+                            val hashedPassword = rs.getString("password_hash")
 
-                    if (rs.next()) {
-                        val hashedPassword = rs.getString("password_hash")
-                        if (BCrypt.checkpw(pass, hashedPassword)) {
-                            // Password matches
-                            call.respond(
-                                mapOf(
-                                    "id" to rs.getInt("id"),
-                                    "tier" to rs.getString("tier")
-                                )
-                            )
-                        } else {
-                            // Password incorrect
-                            call.respond(mapOf("id" to null, "tier" to null))
+                            if (BCrypt.checkpw(pass, hashedPassword)) {
+                                val id = rs.getInt("id")
+                                val tier = rs.getString("tier")
+                                val token = JWT.generateToken(id, email)
+
+                                if (token != null) {
+                                    call.respond(
+                                        mapOf(
+                                            "success" to true,
+                                            "id" to id,
+                                            "tier" to tier,
+                                            "token" to token
+                                        )
+                                    )
+                                }
+                            }
                         }
-                    } else {
-                        // User not found
-                        call.respond(mapOf("id" to null, "tier" to null))
+                        call.respond(
+                            HttpStatusCode.Unauthorized,
+                            mapOf("success" to false, "message" to "Invalid email or password.")
+                        )
                     }
+                } catch (e: java.sql.SQLException) {
+                    call.respond(
+                        HttpStatusCode.InternalServerError,
+                        mapOf("success" to false, "message" to "An unexpected server error occurred.")
+                    )
                 }
             }
 
@@ -329,7 +355,7 @@ fun main() {
                     return@post
                 }
 
-                DriverManager.getConnection(jdbcUrl, username, password).use { conn ->
+                DatabaseFactory.getConnection().use { conn ->
                     val stmt = conn.prepareStatement("""
                         INSERT INTO capture_results 
                         (user_id, image_data, object_name, confidence, description, buy_link)
@@ -368,7 +394,7 @@ fun main() {
                 val historyList = mutableListOf<Map<String, Any?>>()
 
                 try {
-                    DriverManager.getConnection(jdbcUrl, username, password).use { conn ->
+                    DatabaseFactory.getConnection().use { conn ->
                        //Select all captures for this user
                         val stmt = conn.prepareStatement("""
                             SELECT object_name, confidence, description, image_data, buy_link 
